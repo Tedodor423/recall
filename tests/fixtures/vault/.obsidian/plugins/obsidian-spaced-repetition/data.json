@@ -1,0 +1,46 @@
+{
+  "settings": {
+    "flashcardTags": [
+      "#flashnotes",
+      "#flashcards"
+    ],
+    "flashcardTagsToIgnore": [],
+    "convertFoldersToDecks": false,
+    "burySiblingCards": false,
+    "flashcardCardOrder": "EveryCardRandomDeckAndCard",
+    "flashcardDeckOrder": "PrevDeckComplete_Sequential",
+    "convertClozePatternsToInputs": false,
+    "convertHighlightsToClozes": true,
+    "convertBoldTextToClozes": false,
+    "convertCurlyBracketsToClozes": false,
+    "clozePatterns": [
+      "==[123;;]answer[;;hint]=="
+    ],
+    "singleLineCardSeparator": "::",
+    "singleLineReversedCardSeparator": ":::",
+    "multilineCardSeparator": ";;",
+    "multilineReversedCardSeparator": ";;;",
+    "multilineCardEndMarker": "",
+    "editLaterTag": "#edit-later",
+    "tagsToReview": [
+      "#review"
+    ],
+    "noteTagsToIgnore": [],
+    "noteFoldersToIgnore": [
+      "**/*.excalidraw.md"
+    ],
+    "algorithm": "SM-2-OSR",
+    "baseEase": 250,
+    "lapsesIntervalChange": 0.5,
+    "easyBonus": 1.3,
+    "loadBalance": true,
+    "maximumInterval": 36525,
+    "maxLinkFactor": 1,
+    "startOfDay": "00:00:00",
+    "dataStore": "NOTES",
+    "cardCommentOnSameLine": false
+  },
+  "buryDate": "2026-01-01",
+  "buryList": [],
+  "historyDeck": null
+}

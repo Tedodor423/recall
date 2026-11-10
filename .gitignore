@@ -1,0 +1,5 @@
+node_modules/
+*.png
+!tests/fixtures/**/*.png
+__pycache__/
+tests/out/

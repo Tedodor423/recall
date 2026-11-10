@@ -1,0 +1,775 @@
+#!/usr/bin/env python3
+"""recall-io: vault file access for the theo.recall shell plugin.
+
+Python 3 standard library only. Every command prints one JSON object on
+stdout and exits 0, also when it refuses ({"ok": false, "error": code,
+"message": text}). Usage errors exit 2 (still with a JSON object).
+
+  scan   --vault V [--tag T ...] [--fallback-tag T ...]
+                     flashcard notes + assets + plugin settings
+  read   --vault V --path P
+  write  --vault V --path P --expect-sha S --length N --md5 M
+         (--max-change BYTES | --append-only) [--log JSON]     text on stdin
+  create --vault V --path P --length N --md5 M                 text on stdin
+  assets --vault V
+
+Paths are vault-relative ("Notes/x.md"). The vault is resolved with
+realpath; anything that escapes it, has a hidden component (except reading
+.obsidian/app.json and .obsidian/plugins/<p>/data.json), or crosses a
+symlink inside the vault is refused. write/create only touch .md files.
+
+Write safety:
+  * stdin must be exactly --length UTF-8 bytes with md5 --md5, so a feed cut
+    short (the shell dying mid-write, a pipe boundary) is never written;
+  * write is a compare-and-swap on the sha256 of the current file, done under
+    an flock in the state dir, so two writers cannot interleave;
+  * write states its intent: --max-change N refuses when the changed region
+    (old or new side, after the common prefix and suffix) exceeds N bytes,
+    --append-only refuses unless the new text starts with the old text minus
+    its trailing blank lines;
+  * before every write whose current content differs from the newest backup
+    of that note, the note is copied to
+    <state>/backups/YYYY-MM-DD/<path without .md>.HHMMSS.md (30-day prune); a
+    failed backup stops the write;
+  * the note is rewritten in place (same inode: the creation time Windows and
+    Obsidian show is kept, and ntfs3 has no atomic rename-over anyway), then
+    truncated and fsynced. create writes a temp file and hard-links it into
+    place, which never replaces an existing file.
+<state> is ~/.local/state/omarchy/theo.recall unless --state-dir or the
+RECALL_STATE_DIR environment variable says otherwise.
+
+Bytes are never re-encoded: what arrives on stdin is what lands on disk, so
+line endings and everything outside the edit stay exactly as they were.
+"""
+
+import argparse
+import datetime
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+SR_DATA = ".obsidian/plugins/obsidian-spaced-repetition/data.json"
+EXCALIDRAW_DATA = ".obsidian/plugins/obsidian-excalidraw-plugin/data.json"
+APP_JSON = ".obsidian/app.json"
+HIDDEN_READ_OK = re.compile(r"^\.obsidian/(app\.json|plugins/[^./][^/]*/data\.json)$")
+EXCALIDRAW_KEYS = [
+    "folder", "embedUseExcalidrawFolder", "drawingFilenamePrefix",
+    "drawingEmbedPrefixWithFilename", "drawingFilnameEmbedPostfix",
+    "drawingFilenameDateTime", "useExcalidrawExtension", "compress",
+    "templateFilePath", "cropFolder", "annotateFolder",
+]
+BACKUP_DAYS = 30
+TEMP_PREFIX = ".recall-"
+TEMP_SUFFIX = ".recall~"
+# tempfile.mkstemp names: prefix + 8 characters from [a-z0-9_] + suffix.
+TEMP_RE = re.compile(r"^\.recall-[a-z0-9_]{8}\.recall~$")
+TEMP_STALE_SECONDS = 600
+# Osr.appendCard drops exactly this before appending a card.
+TRAILING_BLANK = re.compile(rb"(?:\r?\n[ \t]*)+\Z")
+LOCK_TIMEOUT = 15.0
+
+
+class Refused(Exception):
+    def __init__(self, code, message=""):
+        Exception.__init__(self, message or code)
+        self.code = code
+        self.message = message or code
+
+
+def emit(obj, status=0):
+    data = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(data + b"\n")
+    sys.stdout.buffer.flush()
+    sys.exit(status)
+
+
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def mtime_ms(st):
+    return int(st.st_mtime * 1000)
+
+
+def state_dir(args):
+    d = getattr(args, "state_dir", None) or os.environ.get("RECALL_STATE_DIR")
+    if not d:
+        d = os.path.join(os.path.expanduser("~"), ".local", "state", "omarchy", "theo.recall")
+    return os.path.abspath(os.path.expanduser(d))
+
+
+# ------------------------------------------------------------------ paths
+
+def vault_root(v):
+    if not v:
+        raise Refused("vault-missing", "No vault given")
+    root = os.path.realpath(os.path.expanduser(v))
+    if not os.path.isdir(root):
+        raise Refused("vault-missing", "Vault not found: " + root)
+    return root
+
+
+def check_rel(rel, allow_hidden_read=False):
+    if not isinstance(rel, str) or rel == "":
+        raise Refused("path-refused", "Empty path")
+    if "\x00" in rel or "\\" in rel:
+        raise Refused("path-refused", "Invalid character in path")
+    if rel.startswith("/"):
+        raise Refused("path-refused", "Path must be vault-relative")
+    parts = rel.split("/")
+    for p in parts:
+        if p in ("", ".", ".."):
+            raise Refused("path-refused", "Path escapes or is not normalised: " + rel)
+    if any(p.startswith(".") for p in parts):
+        if not (allow_hidden_read and HIDDEN_READ_OK.match(rel)):
+            raise Refused("path-refused", "Hidden path refused: " + rel)
+    return parts
+
+
+def resolve(vault, rel, allow_hidden_read=False, must_exist=True):
+    """Absolute path for a vault-relative path, refusing symlinks and escapes.
+    With must_exist=False the trailing components may be missing."""
+    parts = check_rel(rel, allow_hidden_read)
+    cur = vault
+    for i, p in enumerate(parts):
+        cur = os.path.join(cur, p)
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            if must_exist:
+                raise Refused("not-found", "No such file: " + rel)
+            break
+        if stat.S_ISLNK(st.st_mode):
+            raise Refused("path-refused", "Symlink inside the vault refused: " + "/".join(parts[:i + 1]))
+        if i < len(parts) - 1 and not stat.S_ISDIR(st.st_mode):
+            raise Refused("path-refused", "Not a directory: " + "/".join(parts[:i + 1]))
+    full = os.path.join(vault, *parts)
+    # Belt and braces: the deepest existing ancestor must still be inside.
+    probe = full
+    while not os.path.lexists(probe):
+        probe = os.path.dirname(probe)
+    real = os.path.realpath(probe)
+    if os.path.commonpath([vault, real]) != vault:
+        raise Refused("path-refused", "Path escapes the vault: " + rel)
+    return full
+
+
+def require_md(rel):
+    if not rel.lower().endswith(".md"):
+        raise Refused("path-refused", "Only .md files can be written: " + rel)
+
+
+def check_case_conflicts(vault, rel):
+    """NTFS (shared with Windows) is case-insensitive even when the Linux
+    driver is not: refuse a new path whose missing components differ only in
+    case from an existing entry in the same directory."""
+    cur = vault
+    parts = rel.split("/")
+    for i, p in enumerate(parts):
+        nxt = os.path.join(cur, p)
+        if not os.path.lexists(nxt):
+            try:
+                names = os.listdir(cur)
+            except OSError:
+                names = []
+            want = p.casefold()
+            for n in names:
+                if n.casefold() == want:
+                    raise Refused("exists", "A file or folder that differs only in case exists: " +
+                                  "/".join(parts[:i] + [n]))
+            return
+        cur = nxt
+
+
+def read_regular(full, rel):
+    try:
+        st = os.lstat(full)
+    except FileNotFoundError:
+        raise Refused("not-found", "No such file: " + rel)
+    if not stat.S_ISREG(st.st_mode):
+        raise Refused("not-a-file", "Not a regular file: " + rel)
+    with open(full, "rb") as f:
+        data = f.read()
+    return data, os.stat(full)
+
+
+def decode(data, rel):
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise Refused("bad-utf8", "Not valid UTF-8 (%s): %s" % (e.reason, rel))
+
+
+def read_stdin_checked(args):
+    """The new text, refused unless it is exactly what the caller meant to send."""
+    data = sys.stdin.buffer.read()
+    if len(data) != args.length:
+        raise Refused("bad-input", "Received %d bytes, expected %d; nothing written" % (len(data), args.length))
+    if hashlib.md5(data).hexdigest() != args.md5.lower():
+        raise Refused("bad-input", "Checksum mismatch on the received text; nothing written")
+    if not data:
+        raise Refused("empty", "Refusing to write an empty file")
+    decode(data, "<stdin>")
+    return data
+
+
+# ---------------------------------------------------------------- settings
+
+def load_json(vault, rel):
+    """(data, error): error is "" when fine, "missing", or "unreadable: ..."."""
+    full = os.path.join(vault, rel)
+    try:
+        st = os.lstat(full)
+    except FileNotFoundError:
+        return None, "missing"
+    except OSError as e:
+        return None, "unreadable: " + str(e)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return None, "unreadable: not a regular file"
+    try:
+        with open(full, "rb") as f:
+            raw = f.read()
+        if not raw.strip():
+            return None, "unreadable: empty file"
+        return json.loads(raw.decode("utf-8")), ""
+    except (OSError, ValueError) as e:
+        return None, "unreadable: " + str(e)
+
+
+def excalidraw_subset(data):
+    if not isinstance(data, dict):
+        return None
+    return {k: data[k] for k in EXCALIDRAW_KEYS if k in data}
+
+
+def sr_tags(sr):
+    s = sr.get("settings", sr) if isinstance(sr, dict) else None
+    tags = s.get("flashcardTags") if isinstance(s, dict) else None
+    if isinstance(tags, list) and tags:
+        return [str(t) for t in tags]
+    return None
+
+
+# --------------------------------------------------------------- scanning
+
+def walk(vault, want_md, temps=None):
+    """Non-hidden regular files, vault-relative, without following symlinks.
+    Our own temp files (hidden) are collected into `temps` when given."""
+    out = []
+    for dirpath, dirnames, filenames in os.walk(vault):
+        dirnames[:] = sorted(d for d in dirnames
+                             if not d.startswith(".") and not os.path.islink(os.path.join(dirpath, d)))
+        rel_dir = os.path.relpath(dirpath, vault)
+        for name in sorted(filenames):
+            if name.startswith("."):
+                if temps is not None and TEMP_RE.match(name):
+                    temps.append(os.path.join(dirpath, name))
+                continue
+            if name.endswith(TEMP_SUFFIX):
+                continue
+            if want_md and not name.lower().endswith(".md"):
+                continue
+            full = os.path.join(dirpath, name)
+            if os.path.islink(full):
+                continue
+            out.append(name if rel_dir == "." else rel_dir.replace(os.sep, "/") + "/" + name)
+    return out
+
+
+def sweep_temps(temps):
+    """Removes temp files a killed create left behind (only our exact name
+    pattern, only regular files, only when stale)."""
+    removed = 0
+    now = time.time()
+    for full in temps:
+        try:
+            st = os.lstat(full)
+            if stat.S_ISREG(st.st_mode) and now - st.st_mtime > TEMP_STALE_SECONDS:
+                os.unlink(full)
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def rg_candidates(vault, needles):
+    """Paths of .md files containing any needle (case-insensitive), or None
+    when ripgrep is unavailable or failed."""
+    rg = shutil.which("rg")
+    if not rg:
+        return None
+    cmd = [rg, "--files-with-matches", "--null", "--fixed-strings", "--ignore-case",
+           "--no-ignore", "--no-messages", "--no-config", "--glob", "*.md", "--glob", "*.MD"]
+    for n in needles:
+        cmd += ["-e", n]
+    # An explicit path and a closed stdin: with no path and a piped stdin,
+    # rg would search stdin instead of the directory.
+    cmd += ["--", "."]
+    try:
+        p = subprocess.run(cmd, cwd=vault, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode not in (0, 1):
+        return None
+    out = []
+    for raw in p.stdout.split(b"\x00"):
+        if not raw:
+            continue
+        rel = os.fsdecode(raw)
+        if rel.startswith("./"):
+            rel = rel[2:]
+        out.append(rel)
+    return out
+
+
+def python_candidates(vault, needles):
+    lowered = [n.lower().encode("utf-8") for n in needles]
+    out = []
+    for rel in walk(vault, True):
+        try:
+            with open(os.path.join(vault, rel), "rb") as f:
+                data = f.read().lower()
+        except OSError:
+            continue
+        if any(n in data for n in lowered):
+            out.append(rel)
+    return out
+
+
+def cmd_scan(args):
+    t0 = time.monotonic()
+    vault = vault_root(args.vault)
+    sr, sr_error = load_json(vault, SR_DATA)
+    exc, exc_error = load_json(vault, EXCALIDRAW_DATA)
+    app, app_error = load_json(vault, APP_JSON)
+    # Tag source: explicit --tag, else SR's settings, else the caller's
+    # fallback (its last good SR tags), else the SR plugin's default.
+    tags_from = "arg"
+    tags = args.tag
+    if not tags:
+        tags, tags_from = sr_tags(sr), "sr"
+    if not tags and args.fallback_tag:
+        tags, tags_from = args.fallback_tag, "fallback"
+    if not tags:
+        tags, tags_from = ["#flashcards"], "default"
+    # Search for the bare tag text: frontmatter tags are written without "#",
+    # and Obsidian tags are case-insensitive. The engine does the real check.
+    needles = sorted({t.lstrip("#").strip() for t in tags if t.lstrip("#").strip()})
+    used_rg = False
+    candidates = None
+    if needles and not args.no_rg:
+        candidates = rg_candidates(vault, needles)
+        used_rg = candidates is not None
+    if candidates is None:
+        candidates = python_candidates(vault, needles) if needles else []
+    files, errors = [], []
+    for rel in sorted(set(candidates)):
+        try:
+            check_rel(rel)
+            full = resolve(vault, rel)
+            data, st = read_regular(full, rel)
+            text = decode(data, rel)
+        except Refused as e:
+            errors.append({"path": rel, "error": e.code, "message": e.message})
+            continue
+        except OSError as e:
+            errors.append({"path": rel, "error": "io", "message": str(e)})
+            continue
+        files.append({"path": rel, "sha": sha256(data), "mtime": mtime_ms(st), "text": text})
+    temps = []
+    assets = walk(vault, False, temps)
+    emit({
+        "ok": True,
+        "vault": vault,
+        "tags": tags,
+        "tagsFrom": tags_from,
+        "rg": used_rg,
+        "files": files,
+        "errors": errors,
+        "assets": assets,
+        "sr": sr,
+        "sr_error": sr_error,
+        "excalidraw": excalidraw_subset(exc),
+        "excalidraw_error": exc_error if exc_error or isinstance(exc, dict) else "unreadable: not an object",
+        "app": app,
+        "app_error": app_error if app_error or isinstance(app, dict) else "unreadable: not an object",
+        "swept": sweep_temps(temps),
+        "ms": int((time.monotonic() - t0) * 1000),
+    })
+
+
+def cmd_assets(args):
+    vault = vault_root(args.vault)
+    emit({"ok": True, "vault": vault, "assets": walk(vault, False)})
+
+
+def cmd_read(args):
+    vault = vault_root(args.vault)
+    full = resolve(vault, args.path, allow_hidden_read=True)
+    data, st = read_regular(full, args.path)
+    emit({"ok": True, "path": args.path, "text": decode(data, args.path),
+          "sha": sha256(data), "mtime": mtime_ms(st)})
+
+
+# ---------------------------------------------------------------- writing
+
+class Lock(object):
+    """Exclusive flock on <state>/write.lock for the read-check-write span."""
+
+    def __init__(self, state):
+        os.makedirs(state, exist_ok=True)
+        self.fd = os.open(os.path.join(state, "write.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+
+    def __enter__(self):
+        deadline = time.monotonic() + LOCK_TIMEOUT
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError as e:
+                if e.errno not in (errno.EAGAIN, errno.EACCES):
+                    raise
+                if time.monotonic() > deadline:
+                    raise Refused("busy", "Another write is still in progress; try again")
+                time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self.fd)
+        return False
+
+
+def fsync_dir(d):
+    try:
+        fd = os.open(d, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def changed_region(old, new):
+    """Sizes of the differing middle of old and new after the common prefix
+    and suffix."""
+    n = min(len(old), len(new))
+    p = 0
+    # Compare in blocks first, then byte by byte.
+    step = 4096
+    while p + step <= n and old[p:p + step] == new[p:p + step]:
+        p += step
+    while p < n and old[p] == new[p]:
+        p += 1
+    s = 0
+    m = n - p
+    while s + step <= m and old[len(old) - s - step:len(old) - s] == new[len(new) - s - step:len(new) - s]:
+        s += step
+    while s < m and old[len(old) - s - 1] == new[len(new) - s - 1]:
+        s += 1
+    return len(old) - p - s, len(new) - p - s
+
+
+BACKUP_NAME = re.compile(r"^(.*)\.(\d{6})(?:-(\d+))?\.md$")
+
+
+def backup_dir_for(state, day, rel):
+    sub = rel.split("/")[:-1]
+    return os.path.join(state, "backups", day, *sub)
+
+
+def newest_backup(state, rel):
+    """Path of the newest backup of `rel`, or None."""
+    root = os.path.join(state, "backups")
+    try:
+        days = sorted((d for d in os.listdir(root) if re.match(r"^\d{4}-\d{2}-\d{2}$", d)), reverse=True)
+    except OSError:
+        return None
+    base = rel.split("/")[-1][:-3]
+    for day in days:
+        d = backup_dir_for(state, day, rel)
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        best, best_key = None, None
+        for name in names:
+            m = BACKUP_NAME.match(name)
+            if not m or m.group(1) != base:
+                continue
+            key = (m.group(2), int(m.group(3) or 0))
+            if best_key is None or key > best_key:
+                best, best_key = os.path.join(d, name), key
+        if best:
+            return best
+    return None
+
+
+def backup(state, rel, data, now):
+    """Copies `data` (the note's current bytes) unless the newest backup of
+    the note already holds exactly that. Returns the new backup path or None."""
+    prev = newest_backup(state, rel)
+    if prev:
+        try:
+            with open(prev, "rb") as f:
+                if f.read() == data:
+                    return None
+        except OSError:
+            pass
+    d = backup_dir_for(state, now.date().isoformat(), rel)
+    os.makedirs(d, exist_ok=True)
+    base = rel.split("/")[-1][:-3] + "." + now.strftime("%H%M%S")
+    dest = os.path.join(d, base + ".md")
+    i = 0
+    while os.path.lexists(dest):
+        i += 1
+        dest = os.path.join(d, "%s-%d.md" % (base, i))
+    tmp = dest + ".part"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, dest)
+    return dest
+
+
+def prune_backups(state, today):
+    root = os.path.join(state, "backups")
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    cutoff = today - datetime.timedelta(days=BACKUP_DAYS)
+    removed = []
+    for name in names:
+        try:
+            day = datetime.date.fromisoformat(name)
+        except ValueError:
+            continue
+        if day < cutoff:
+            shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+            removed.append(name)
+    return removed
+
+
+def append_log(state, line):
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        return "log line is not JSON"
+    os.makedirs(state, exist_ok=True)
+    data = (json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    fd = os.open(os.path.join(state, "reviews.jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    return ""
+
+
+def check_change(args, cur, new, rel):
+    if args.append_only:
+        base = TRAILING_BLANK.sub(b"", cur)
+        if not base.strip():
+            base = b""
+        if not new.startswith(base) or len(new) <= len(base):
+            raise Refused("not-append", "Adding a card may only append to %s; nothing written" % rel)
+    else:
+        a, b = changed_region(cur, new)
+        if a > args.max_change or b > args.max_change:
+            raise Refused("too-big-change", "The change to %s spans %d bytes (limit %d); nothing written" %
+                          (rel, max(a, b), args.max_change))
+
+
+def cmd_write(args):
+    if args.append_only == (args.max_change is not None):
+        raise Refused("usage", "write needs exactly one of --max-change or --append-only")
+    vault = vault_root(args.vault)
+    require_md(args.path)
+    full = resolve(vault, args.path)
+    new = read_stdin_checked(args)
+    state = state_dir(args)
+    result = {"ok": True, "path": args.path}
+    with Lock(state):
+        # Re-resolve under the lock (nothing in the chain became a symlink).
+        full = resolve(vault, args.path)
+        st0 = os.lstat(full)
+        if not stat.S_ISREG(st0.st_mode):
+            raise Refused("not-a-file", "Not a regular file: " + args.path)
+        with open(full, "r+b") as f:
+            cur = f.read()
+            cur_sha = sha256(cur)
+            if cur_sha != args.expect_sha:
+                emit({"ok": False, "error": "conflict", "message": "The note changed on disk since it was read",
+                      "sha": cur_sha, "mtime": mtime_ms(os.fstat(f.fileno()))})
+            if new == cur:
+                result["unchanged"] = True
+            else:
+                check_change(args, cur, new, args.path)
+                now = datetime.datetime.now()
+                saved = backup(state, args.path, cur, now)
+                if saved:
+                    result["backup"] = saved
+                f.seek(0)
+                f.write(new)
+                f.truncate(len(new))
+                f.flush()
+                os.fsync(f.fileno())
+                pruned = prune_backups(state, now.date())
+                if pruned:
+                    result["pruned"] = pruned
+        if args.log:
+            err = append_log(state, args.log)
+            if err:
+                result["logError"] = err
+    after = os.stat(full)
+    result["sha"] = sha256(new)
+    result["mtime"] = mtime_ms(after)
+    emit(result)
+
+
+def write_temp(directory, data, mode):
+    fd, tmp = tempfile.mkstemp(prefix=TEMP_PREFIX, suffix=TEMP_SUFFIX, dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp, mode)
+        except OSError:
+            pass
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return tmp
+
+
+def cmd_create(args):
+    vault = vault_root(args.vault)
+    require_md(args.path)
+    resolve(vault, args.path, must_exist=False)
+    data = read_stdin_checked(args)
+    state = state_dir(args)
+    with Lock(state):
+        full = resolve(vault, args.path, must_exist=False)
+        if os.path.lexists(full):
+            raise Refused("exists", "File already exists: " + args.path)
+        check_case_conflicts(vault, args.path)
+        parent = os.path.dirname(full)
+        os.makedirs(parent, exist_ok=True)
+        # The new directories are ours, but check again that nothing in the
+        # chain became a symlink meanwhile.
+        resolve(vault, args.path, must_exist=False)
+        umask = os.umask(0)
+        os.umask(umask)
+        mode = 0o666 & ~umask
+        tmp = write_temp(parent, data, mode)
+        try:
+            try:
+                # link() never replaces an existing file: an atomic no-clobber create.
+                os.link(tmp, full)
+            except FileExistsError:
+                raise Refused("exists", "File already exists: " + args.path)
+            except OSError:
+                # Filesystem without hard links: exclusive create, then write.
+                try:
+                    fd = os.open(full, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+                except FileExistsError:
+                    raise Refused("exists", "File already exists: " + args.path)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        fsync_dir(parent)
+    st = os.stat(full)
+    emit({"ok": True, "path": args.path, "sha": sha256(data), "mtime": mtime_ms(st)})
+
+
+# -------------------------------------------------------------------- main
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        emit({"ok": False, "error": "usage", "message": message}, 2)
+
+
+def main(argv):
+    p = Parser(prog="recall-io", description="Vault file access for theo.recall")
+    sub = p.add_subparsers(dest="cmd")
+
+    def common(sp):
+        sp.add_argument("--vault", required=True)
+        sp.add_argument("--state-dir", default=None)
+
+    def integrity(sp):
+        sp.add_argument("--length", type=int, required=True, help="UTF-8 byte length of stdin")
+        sp.add_argument("--md5", required=True, help="md5 hex of stdin")
+
+    s = sub.add_parser("scan")
+    common(s)
+    s.add_argument("--tag", action="append", default=[])
+    s.add_argument("--fallback-tag", action="append", default=[],
+                   help="tags to use when no --tag is given and SR's data.json cannot be read")
+    s.add_argument("--no-rg", action="store_true", help="force the Python fallback")
+    s.set_defaults(fn=cmd_scan)
+
+    s = sub.add_parser("assets")
+    common(s)
+    s.set_defaults(fn=cmd_assets)
+
+    s = sub.add_parser("read")
+    common(s)
+    s.add_argument("--path", required=True)
+    s.set_defaults(fn=cmd_read)
+
+    s = sub.add_parser("write")
+    common(s)
+    integrity(s)
+    s.add_argument("--path", required=True)
+    s.add_argument("--expect-sha", required=True)
+    s.add_argument("--max-change", type=int, default=None, help="largest changed region allowed, in bytes")
+    s.add_argument("--append-only", action="store_true", help="the new text must extend the old one")
+    s.add_argument("--log", default="", help="JSON line appended to reviews.jsonl after the write")
+    s.set_defaults(fn=cmd_write)
+
+    s = sub.add_parser("create")
+    common(s)
+    integrity(s)
+    s.add_argument("--path", required=True)
+    s.set_defaults(fn=cmd_create)
+
+    args = p.parse_args(argv)
+    if not getattr(args, "fn", None):
+        p.error("missing command")
+    try:
+        args.fn(args)
+    except Refused as e:
+        emit({"ok": False, "error": e.code, "message": e.message}, 2 if e.code == "usage" else 0)
+    except OSError as e:
+        emit({"ok": False, "error": "io", "message": str(e)})
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

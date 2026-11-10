@@ -1,0 +1,13 @@
+{
+  "folder": "Files/excalidraw",
+  "embedUseExcalidrawFolder": true,
+  "drawingFilenamePrefix": "ED-",
+  "drawingEmbedPrefixWithFilename": true,
+  "drawingFilnameEmbedPostfix": " ",
+  "drawingFilenameDateTime": "YYYYMMDDHHmm",
+  "useExcalidrawExtension": false,
+  "compress": true,
+  "templateFilePath": "Templates/Excalidraw",
+  "cropFolder": "Files/excalidraw/cropped",
+  "annotateFolder": "Files/excalidraw/annotations"
+}
